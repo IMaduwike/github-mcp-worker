@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "github-mcp-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GITHUB_MCP",
+        "class_name": "GitHubMCP"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GitHubMCP"]
+    }
+  ]
+}
