@@ -4,11 +4,16 @@ import { z } from "zod";
 
 type Env = {
   GITHUB_TOKEN: string;
-  MCP_ACCESS_TOKEN: string;
   MCP_OBJECT: DurableObjectNamespace;
 };
 
 const API = "https://api.github.com";
+
+const HEADERS = {
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28",
+  "User-Agent": "github-mcp-worker"
+};
 
 async function githubRequest(
   env: Env,
@@ -23,13 +28,19 @@ async function githubRequest(
     throw new Error("Invalid GitHub API path");
   }
 
+  const token = env.GITHUB_TOKEN?.trim();
+
+  if (!token) {
+    throw new Error(
+      "GITHUB_TOKEN is missing or empty in the deployed Worker."
+    );
+  }
+
   const response = await fetch(API + path, {
     ...init,
     headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "github-mcp-worker",
+      ...HEADERS,
+      Authorization: `Bearer ${token}`,
       ...(init.body
         ? { "Content-Type": "application/json" }
         : {}),
@@ -55,29 +66,65 @@ export class GitHubMCP extends McpAgent<Env> {
   });
 
   async init() {
+    // Diagnostic: verifies the actual token supplied by Cloudflare.
     this.server.tool(
       "github_whoami",
-      "Get the GitHub account associated with the configured token.",
+      "Check GitHub authentication and identify the authenticated account.",
       {},
       async () => {
-        const data = await githubRequest(this.env, "/user");
+        const token = this.env.GITHUB_TOKEN?.trim();
+
+        if (!token) {
+          return {
+            content: [{
+              type: "text",
+              text: "GITHUB_TOKEN IS MISSING OR EMPTY."
+            }],
+            isError: true
+          };
+        }
+
+        const response = await fetch(`${API}/user`, {
+          headers: {
+            ...HEADERS,
+            Authorization: `Bearer ${token}`
+          }
+        });
+
+        const body = await response.text();
+
+        if (!response.ok) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                `GitHub authentication test returned HTTP ${response.status}.\n` +
+                body.slice(0, 1500)
+            }],
+            isError: true
+          };
+        }
+
+        const user = JSON.parse(body);
 
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              login: data.login,
-              id: data.id,
-              html_url: data.html_url
+              success: true,
+              login: user.login,
+              id: user.id,
+              html_url: user.html_url
             }, null, 2)
           }]
         };
       }
     );
 
+    // General GitHub REST API access.
     this.server.tool(
       "github_api_request",
-      "Make a GitHub REST API request. Supports repository operations, files, issues, pull requests, branches, releases, and more, subject to token permissions.",
+      "Make a GitHub REST API request. Supports repositories, files, issues, pull requests, branches, releases, and other endpoints allowed by the token.",
       {
         method: z.enum([
           "GET",
@@ -106,6 +153,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // GitHub GraphQL.
     this.server.tool(
       "github_graphql",
       "Execute a GitHub GraphQL query or mutation.",
@@ -114,24 +162,27 @@ export class GitHubMCP extends McpAgent<Env> {
         variables: z.record(z.string(), z.unknown()).optional()
       },
       async ({ query, variables }) => {
-        const response = await fetch(
-          "https://api.github.com/graphql",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${this.env.GITHUB_TOKEN}`,
-              "Content-Type": "application/json",
-              "User-Agent": "github-mcp-worker"
-            },
-            body: JSON.stringify({ query, variables })
-          }
-        );
+        const token = this.env.GITHUB_TOKEN?.trim();
 
-        const result = await response.json();
+        if (!token) {
+          throw new Error("GITHUB_TOKEN is missing or empty.");
+        }
 
-        if (!response.ok) {
+        const response = await fetch(`${API}/graphql`, {
+          method: "POST",
+          headers: {
+            ...HEADERS,
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ query, variables })
+        });
+
+        const result: any = await response.json();
+
+        if (!response.ok || result.errors) {
           throw new Error(
-            `GraphQL error: ${JSON.stringify(result)}`
+            `GraphQL error: ${JSON.stringify(result).slice(0, 1500)}`
           );
         }
 
@@ -144,6 +195,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Search repositories.
     this.server.tool(
       "github_search_repositories",
       "Search GitHub repositories.",
@@ -166,6 +218,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // List branches.
     this.server.tool(
       "github_list_branches",
       "List branches in a repository.",
@@ -189,6 +242,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Dispatch a workflow.
     this.server.tool(
       "github_dispatch_workflow",
       "Run a GitHub Actions workflow.",
@@ -202,10 +256,13 @@ export class GitHubMCP extends McpAgent<Env> {
       async ({ owner, repo, workflow_id, ref, inputs }) => {
         await githubRequest(
           this.env,
-          `/repos/${owner}/${repo}/actions/workflows/${workflow_id}/dispatches`,
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/${encodeURIComponent(String(workflow_id))}/dispatches`,
           {
             method: "POST",
-            body: JSON.stringify({ ref, inputs })
+            body: JSON.stringify({
+              ref,
+              ...(inputs ? { inputs } : {})
+            })
           }
         );
 
@@ -218,6 +275,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // List workflow runs.
     this.server.tool(
       "github_list_workflow_runs",
       "List GitHub Actions workflow runs.",
@@ -229,7 +287,7 @@ export class GitHubMCP extends McpAgent<Env> {
       async ({ owner, repo, per_page }) => {
         const result = await githubRequest(
           this.env,
-          `/repos/${owner}/${repo}/actions/runs?per_page=${per_page ?? 20}`
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs?per_page=${per_page ?? 20}`
         );
 
         return {
@@ -241,6 +299,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Cancel workflow run.
     this.server.tool(
       "github_cancel_workflow_run",
       "Cancel a workflow run.",
@@ -252,7 +311,7 @@ export class GitHubMCP extends McpAgent<Env> {
       async ({ owner, repo, run_id }) => {
         await githubRequest(
           this.env,
-          `/repos/${owner}/${repo}/actions/runs/${run_id}/cancel`,
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${run_id}/cancel`,
           { method: "POST" }
         );
 
@@ -265,9 +324,10 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Rerun workflow.
     this.server.tool(
       "github_rerun_workflow",
-      "Re-run a workflow.",
+      "Rerun a workflow.",
       {
         owner: z.string(),
         repo: z.string(),
@@ -276,7 +336,7 @@ export class GitHubMCP extends McpAgent<Env> {
       async ({ owner, repo, run_id }) => {
         await githubRequest(
           this.env,
-          `/repos/${owner}/${repo}/actions/runs/${run_id}/rerun`,
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${run_id}/rerun`,
           { method: "POST" }
         );
 
@@ -289,6 +349,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // List Codespaces.
     this.server.tool(
       "github_list_codespaces",
       "List Codespaces belonging to a GitHub user.",
@@ -310,6 +371,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Create Codespace.
     this.server.tool(
       "github_create_codespace",
       "Create a Codespace for a repository.",
@@ -322,12 +384,12 @@ export class GitHubMCP extends McpAgent<Env> {
       async ({ owner, repo, branch, machine }) => {
         const result = await githubRequest(
           this.env,
-          `/repos/${owner}/${repo}/codespaces`,
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/codespaces`,
           {
             method: "POST",
             body: JSON.stringify({
-              ref: branch,
-              machine
+              ...(branch ? { ref: branch } : {}),
+              ...(machine ? { machine } : {})
             })
           }
         );
@@ -341,6 +403,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Stop Codespace.
     this.server.tool(
       "github_stop_codespace",
       "Stop a Codespace.",
@@ -363,6 +426,7 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+    // Delete Codespace.
     this.server.tool(
       "github_delete_codespace",
       "Delete a Codespace.",
@@ -406,12 +470,14 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
+    // Temporary MCP access token for testing.
+    // Change this to a long random value before production use.
     if (
-  request.headers.get("Authorization") !==
-    "Bearer neon-mcp-test-2026-change-this"
-) {
-  return new Response("Unauthorized", { status: 401 });
-}
+      request.headers.get("Authorization") !==
+      "Bearer neon-mcp-test-2026-change-this"
+    ) {
+      return new Response("Unauthorized", { status: 401 });
+    }
 
     return GitHubMCP.serve("/mcp").fetch(request, env, ctx);
   }
