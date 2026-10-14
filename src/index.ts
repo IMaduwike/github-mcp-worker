@@ -5,7 +5,7 @@ import { z } from "zod";
 type Env = {
   GITHUB_TOKEN: string;
   MCP_ACCESS_TOKEN: string;
-  GITHUB_MCP: DurableObjectNamespace;
+  MCP_OBJECT: DurableObjectNamespace;;
 };
 
 const API = "https://api.github.com";
