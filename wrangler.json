@@ -4,6 +4,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-13",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["GITHUB_TOKEN"]
+  },
   "durable_objects": {
     "bindings": [
       {
