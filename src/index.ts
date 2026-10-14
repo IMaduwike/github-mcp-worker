@@ -4,7 +4,7 @@ import { z } from "zod";
 
 type Env = {
   GITHUB_TOKEN: string;
-  MCP_ACCESS_TOKEN: string;
+  MCP_ACCESS_TOKEN: "test123";
   GITHUB_MCP: DurableObjectNamespace;
 };
 
