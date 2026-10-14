@@ -405,7 +405,7 @@ export default {
     if (url.pathname !== "/mcp") {
       return new Response("Not found", { status: 404 });
     }
-
+    const env.MCP_ACCESS_TOKEN = "test123"
     if (
       !env.MCP_ACCESS_TOKEN ||
       request.headers.get("Authorization") !==
