@@ -28,9 +28,16 @@ jobs:
       - name: Install Wrangler
         run: npm install --global wrangler
 
+      - name: Upload GitHub token to Worker
+        run: |
+          printf '%s' "$GITHUB_PAT" | wrangler secret put GITHUB_TOKEN
+        env:
+          GITHUB_PAT: ${{ secrets.TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Deploy Worker
         run: wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          GITHUB_TOKEN: ${{ secrets.TOKEN }}
