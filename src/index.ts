@@ -407,12 +407,11 @@ export default {
     }
     const env.MCP_ACCESS_TOKEN = "test123"
     if (
-      !env.MCP_ACCESS_TOKEN ||
-      request.headers.get("Authorization") !==
-        `Bearer ${env.MCP_ACCESS_TOKEN}`
-    ) {
-      return new Response("Unauthorized", { status: 401 });
-    }
+  request.headers.get("Authorization") !==
+    "Bearer neon-mcp-test-2026-change-this"
+) {
+  return new Response("Unauthorized", { status: 401 });
+}
 
     return GitHubMCP.serve("/mcp").fetch(request, env, ctx);
   }
