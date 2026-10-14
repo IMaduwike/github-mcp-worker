@@ -4,7 +4,7 @@ import { z } from "zod";
 
 type Env = {
   GITHUB_TOKEN: string;
-  MCP_ACCESS_TOKEN: "test123";
+  MCP_ACCESS_TOKEN: string;
   GITHUB_MCP: DurableObjectNamespace;
 };
 
@@ -405,7 +405,7 @@ export default {
     if (url.pathname !== "/mcp") {
       return new Response("Not found", { status: 404 });
     }
-    const env.MCP_ACCESS_TOKEN = "test123"
+
     if (
   request.headers.get("Authorization") !==
     "Bearer neon-mcp-test-2026-change-this"
