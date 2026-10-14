@@ -466,6 +466,13 @@ export default {
       });
     }
 
+    if (url.pathname === "/debug-env") {
+  return Response.json({
+    tokenExists: !!env.GITHUB_TOKEN,
+    tokenLength: env.GITHUB_TOKEN?.length ?? 0,
+    mcpBindingExists: !!env.MCP_OBJECT
+  });
+}
     if (url.pathname !== "/mcp") {
       return new Response("Not found", { status: 404 });
     }
