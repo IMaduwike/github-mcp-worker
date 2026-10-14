@@ -4,14 +4,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-13",
   "compatibility_flags": ["nodejs_compat"],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "GITHUB_MCP",
-        "class_name": "GitHubMCP"
-      }
-    ]
-  },
+ "durable_objects": {
+  "bindings": [
+    {
+      "name": "MCP_OBJECT",
+      "class_name": "GitHubMCP"
+    }
+  ]
+},
   "migrations": [
     {
       "tag": "v1",
