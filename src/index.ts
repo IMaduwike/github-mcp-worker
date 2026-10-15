@@ -656,7 +656,9 @@ function constantTimeEqual(a: string, b: string): boolean {
 export default new OAuthProvider<Env>({
   apiRoute: "/mcp",
   apiHandler: GitHubMCP.serve("/mcp"),
-  defaultHandler: authorizationHandler,
+  defaultHandler: {
+  fetch: authorizationHandler
+},
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",
 
