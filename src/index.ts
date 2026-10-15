@@ -377,6 +377,744 @@ export class GitHubMCP extends McpAgent<Env> {
       }
     );
 
+        // Read a repository's file tree.
+    this.server.tool(
+      "github_repo_tree",
+      "List repository files and directories.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        ref: z.string().optional(),
+        path_prefix: z.string().optional(),
+      },
+      async ({ owner, repo, ref, path_prefix }) => {
+        const r = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/git/trees/${encodeURIComponent(ref || "HEAD")}?recursive=1`
+        );
+
+        const entries = (r.tree || [])
+          .filter((x: any) => !path_prefix || x.path.startsWith(path_prefix))
+          .slice(0, 500);
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              truncated: r.truncated,
+              entries,
+            }, null, 2).slice(0, 18000),
+          }],
+        };
+      }
+    );
+
+    // Read a file with optional line ranges.
+    this.server.tool(
+      "github_read_file",
+      "Read a repository file, optionally selecting line numbers.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        path: z.string(),
+        ref: z.string().optional(),
+        start_line: z.number().int().min(1).optional(),
+        end_line: z.number().int().min(1).optional(),
+      },
+      async ({ owner, repo, path, ref, start_line, end_line }) => {
+        if (path.startsWith("/") || path.split("/").includes("..")) {
+          throw new Error("Invalid file path.");
+        }
+
+        const p = path.split("/").map(encodeURIComponent).join("/");
+        const q = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+
+        const r = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/contents/${p}${q}`
+        );
+
+        if (r.type !== "file" || !r.content) {
+          throw new Error("Not a readable file.");
+        }
+
+        const decoded = atob(r.content.replace(/\s/g, ""));
+        const content = new TextDecoder().decode(
+          Uint8Array.from(decoded, c => c.charCodeAt(0))
+        );
+
+        const lines = content.split("\n");
+        const start = Math.max(1, start_line || 1);
+        const end = Math.min(lines.length, end_line || lines.length);
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              path,
+              total_lines: lines.length,
+              content: lines
+                .slice(start - 1, end)
+                .map((line, i) => `${start + i}: ${line}`)
+                .join("\n"),
+            }).slice(0, 18000),
+          }],
+        };
+      }
+    );
+
+    // Search text in repository source files.
+    this.server.tool(
+      "github_repo_grep",
+      "Search for text across a bounded number of repository source files.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        query: z.string().min(1),
+        ref: z.string().optional(),
+        path_prefix: z.string().optional(),
+        max_files: z.number().int().min(1).max(100).optional(),
+        case_sensitive: z.boolean().optional(),
+      },
+      async ({ owner, repo, query, ref, path_prefix, max_files, case_sensitive }) => {
+        const tree = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/git/trees/${encodeURIComponent(ref || "HEAD")}?recursive=1`
+        );
+
+        const files = (tree.tree || [])
+          .filter((f: any) =>
+            f.type === "blob" &&
+            (f.size || 0) <= 200000 &&
+            (!path_prefix || f.path.startsWith(path_prefix)) &&
+            /\.(ts|tsx|js|jsx|py|cpp|h|hpp|json|md|yml|yaml|toml|go|rs|html|css|sh|txt)$/i.test(f.path)
+          )
+          .slice(0, max_files || 30);
+
+        const matches: any[] = [];
+        let scanned = 0;
+
+        for (const file of files) {
+          try {
+            const p = file.path.split("/").map(encodeURIComponent).join("/");
+            const q = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+            const data = await githubRequest(
+              this.env,
+              `/repos/${owner}/${repo}/contents/${p}${q}`
+            );
+
+            if (!data.content || data.encoding !== "base64") continue;
+
+            const decoded = atob(data.content.replace(/\s/g, ""));
+            const text = new TextDecoder().decode(
+              Uint8Array.from(decoded, c => c.charCodeAt(0))
+            );
+
+            scanned++;
+            const lines = text.split("\n");
+            const needle = case_sensitive ? query : query.toLowerCase();
+
+            for (let i = 0; i < lines.length; i++) {
+              const hay = case_sensitive ? lines[i] : lines[i].toLowerCase();
+
+              if (hay.includes(needle)) {
+                matches.push({
+                  path: file.path,
+                  line: i + 1,
+                  text: lines[i].slice(0, 300),
+                });
+              }
+
+              if (matches.length >= 100) break;
+            }
+          } catch {
+            // Skip files that cannot be read.
+          }
+
+          if (matches.length >= 100) break;
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              query,
+              scanned_files: scanned,
+              matches,
+              truncated: tree.truncated || matches.length >= 100,
+            }, null, 2).slice(0, 18000),
+          }],
+        };
+      }
+    );
+
+    // Commit several file changes together.
+    this.server.tool(
+      "github_multi_file_commit",
+      "Create, update, or delete multiple repository files in one commit.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        branch: z.string(),
+        message: z.string(),
+        changes: z.array(z.object({
+          path: z.string(),
+          content: z.string().optional(),
+          delete: z.boolean().optional(),
+        })).min(1).max(50),
+      },
+      async ({ owner, repo, branch, message, changes }) => {
+        const root = `/repos/${owner}/${repo}`;
+
+        const seen = new Set<string>();
+
+        for (const c of changes) {
+          if (
+            c.path.startsWith("/") ||
+            c.path.includes("\\") ||
+            c.path.split("/").some(s => !s || s === "." || s === "..")
+          ) {
+            throw new Error(`Invalid path: ${c.path}`);
+          }
+
+          if (seen.has(c.path)) {
+            throw new Error(`Duplicate path: ${c.path}`);
+          }
+
+          seen.add(c.path);
+
+          if (!c.delete && c.content === undefined) {
+            throw new Error(`Missing content for ${c.path}`);
+          }
+        }
+
+        const branchPath = branch
+          .split("/")
+          .map(encodeURIComponent)
+          .join("/");
+
+        const ref = await githubRequest(
+          this.env,
+          `${root}/git/ref/heads/${branchPath}`
+        );
+
+        const parentSha = ref.object.sha;
+
+        const parent = await githubRequest(
+          this.env,
+          `${root}/git/commits/${parentSha}`
+        );
+
+        const entries: any[] = [];
+
+        for (const c of changes) {
+          if (c.delete) {
+            entries.push({
+              path: c.path,
+              mode: "100644",
+              type: "blob",
+              sha: null,
+            });
+          } else {
+            const blob = await githubRequest(
+              this.env,
+              `${root}/git/blobs`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  content: c.content,
+                  encoding: "utf-8",
+                }),
+              }
+            );
+
+            entries.push({
+              path: c.path,
+              mode: "100644",
+              type: "blob",
+              sha: blob.sha,
+            });
+          }
+        }
+
+        const tree = await githubRequest(
+          this.env,
+          `${root}/git/trees`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              base_tree: parent.tree.sha,
+              tree: entries,
+            }),
+          }
+        );
+
+        const commit = await githubRequest(
+          this.env,
+          `${root}/git/commits`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              message,
+              tree: tree.sha,
+              parents: [parentSha],
+            }),
+          }
+        );
+
+        // Refuse to overwrite a branch that changed during this operation.
+        const current = await githubRequest(
+          this.env,
+          `${root}/git/ref/heads/${branchPath}`
+        );
+
+        if (current.object.sha !== parentSha) {
+          throw new Error(
+            "Branch changed while preparing the commit. Retry to avoid overwriting newer changes."
+          );
+        }
+
+        await githubRequest(
+          this.env,
+          `${root}/git/refs/heads/${branchPath}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({
+              sha: commit.sha,
+              force: false,
+            }),
+          }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              commit: commit.sha,
+              url: commit.html_url,
+              branch,
+              changes: changes.map(c => ({
+                path: c.path,
+                action: c.delete ? "deleted" : "written",
+              })),
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Create a repository.
+    this.server.tool(
+      "github_create_repository",
+      "Create a repository under the authenticated GitHub account.",
+      {
+        name: z.string().min(1),
+        description: z.string().optional(),
+        private: z.boolean().optional(),
+        auto_init: z.boolean().optional(),
+      },
+      async ({ name, description, private: isPrivate, auto_init }) => {
+        const result = await githubRequest(
+          this.env,
+          "/user/repos",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              name,
+              description: description || "",
+              private: isPrivate ?? true,
+              auto_init: auto_init ?? true,
+            }),
+          }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              name: result.full_name,
+              private: result.private,
+              url: result.html_url,
+              default_branch: result.default_branch,
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Delete a repository. This is destructive.
+    this.server.tool(
+      "github_delete_repository",
+      "Permanently delete a repository. Requires explicit user authorization.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        confirm_repository_name: z.string(),
+      },
+      async ({ owner, repo, confirm_repository_name }) => {
+        if (confirm_repository_name !== `${owner}/${repo}`) {
+          throw new Error(
+            `Confirmation must exactly match ${owner}/${repo}.`
+          );
+        }
+
+        await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}`,
+          { method: "DELETE" }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: `Repository ${owner}/${repo} was deleted.`,
+          }],
+        };
+      }
+    );
+
+    // Clone a repository's Git content into a new repository.
+    this.server.tool(
+      "github_clone_repository",
+      "Copy a source repository's files and directories into a newly created repository. Copies the selected ref's current tree, not full Git history.",
+      {
+        source_owner: z.string(),
+        source_repo: z.string(),
+        target_name: z.string().min(1),
+        target_private: z.boolean().optional(),
+        source_ref: z.string().optional(),
+        description: z.string().optional(),
+      },
+      async ({
+        source_owner,
+        source_repo,
+        target_name,
+        target_private,
+        source_ref,
+        description,
+      }) => {
+        const sourceRoot = `/repos/${source_owner}/${source_repo}`;
+
+        const source = await githubRequest(
+          this.env,
+          `${sourceRoot}/git/trees/${encodeURIComponent(source_ref || "HEAD")}?recursive=1`
+        );
+
+        if (source.truncated) {
+          throw new Error(
+            "Source tree is too large for a safe clone through this tool."
+          );
+        }
+
+        const repo = await githubRequest(
+          this.env,
+          "/user/repos",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              name: target_name,
+              description: description || `Copy of ${source_owner}/${source_repo}`,
+              private: target_private ?? true,
+              auto_init: false,
+            }),
+          }
+        );
+
+        const targetRoot = `/repos/${repo.owner.login}/${repo.name}`;
+        const entries: any[] = [];
+
+        for (const item of source.tree || []) {
+          if (item.type !== "blob") continue;
+
+          if ((item.size || 0) > 500000) {
+            throw new Error(
+              `File ${item.path} exceeds the 500 KB per-file clone limit. The target repository may already have been created.`
+            );
+          }
+
+          const blob = await githubRequest(
+            this.env,
+            `${sourceRoot}/git/blobs/${item.sha}`
+          );
+
+          entries.push({
+            path: item.path,
+            mode: item.mode || "100644",
+            type: "blob",
+            sha: item.sha,
+          });
+        }
+
+        const tree = await githubRequest(
+          this.env,
+          `${targetRoot}/git/trees`,
+          {
+            method: "POST",
+            body: JSON.stringify({ tree: entries }),
+          }
+        );
+
+        const commit = await githubRequest(
+          this.env,
+          `${targetRoot}/git/commits`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              message: `Initial copy of ${source_owner}/${source_repo}`,
+              tree: tree.sha,
+              parents: [],
+            }),
+          }
+        );
+
+        await githubRequest(
+          this.env,
+          `${targetRoot}/git/refs`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              ref: "refs/heads/main",
+              sha: commit.sha,
+            }),
+          }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source: `${source_owner}/${source_repo}`,
+              repository: repo.full_name,
+              url: repo.html_url,
+              files_copied: entries.length,
+              commit: commit.sha,
+              note: "This copies the selected ref's file tree. It does not copy branches, tags, or Git history.",
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Create a branch from another ref.
+    this.server.tool(
+      "github_create_branch",
+      "Create a branch from a branch, tag, or commit.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        branch: z.string(),
+        from_ref: z.string().optional(),
+      },
+      async ({ owner, repo, branch, from_ref }) => {
+        if (
+          !branch ||
+          branch.startsWith("/") ||
+          branch.includes("..") ||
+          /[ ~^:?*[\]\\]/.test(branch)
+        ) {
+          throw new Error("Invalid branch name.");
+        }
+
+        const source = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/commits/${encodeURIComponent(from_ref || "HEAD")}`
+        );
+
+        const result = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/git/refs`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              ref: `refs/heads/${branch}`,
+              sha: source.sha,
+            }),
+          }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              branch: result.ref,
+              sha: result.object.sha,
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Open a pull request.
+    this.server.tool(
+      "github_create_pull_request",
+      "Create a pull request from a head branch to a base branch.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        title: z.string(),
+        head: z.string(),
+        base: z.string(),
+        body: z.string().optional(),
+        draft: z.boolean().optional(),
+      },
+      async ({ owner, repo, title, head, base, body, draft }) => {
+        const result = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/pulls`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              title,
+              head,
+              base,
+              body: body || "",
+              draft: draft ?? false,
+            }),
+          }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              number: result.number,
+              url: result.html_url,
+              state: result.state,
+              draft: result.draft,
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Merge a pull request only when explicitly requested.
+    this.server.tool(
+      "github_merge_pull_request",
+      "Merge a pull request when explicitly requested.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        pull_number: z.number().int().min(1),
+        merge_method: z.enum(["merge", "squash", "rebase"]).optional(),
+        expected_head_sha: z.string().optional(),
+      },
+      async ({ owner, repo, pull_number, merge_method, expected_head_sha }) => {
+        const result = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/pulls/${pull_number}/merge`,
+          {
+            method: "PUT",
+            body: JSON.stringify({
+              merge_method: merge_method || "squash",
+              ...(expected_head_sha ? { sha: expected_head_sha } : {}),
+            }),
+          }
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Read workflow failures and identify failed steps.
+    this.server.tool(
+      "github_read_workflow_failure",
+      "Summarize failed jobs and steps for a GitHub Actions run.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        run_id: z.number().int().min(1),
+      },
+      async ({ owner, repo, run_id }) => {
+        const result = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/actions/runs/${run_id}/jobs?per_page=100`
+        );
+
+        const failed = (result.jobs || [])
+          .filter((j: any) => j.conclusion === "failure")
+          .map((j: any) => ({
+            name: j.name,
+            url: j.html_url,
+            failed_steps: (j.steps || [])
+              .filter((s: any) => s.conclusion === "failure")
+              .map((s: any) => ({
+                name: s.name,
+                number: s.number,
+              })),
+          }));
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ run_id, failed_jobs: failed }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Read benchmark results stored in the repository.
+    this.server.tool(
+      "github_get_benchmark_results",
+      "Read benchmark JSON committed to a repository.",
+      {
+        owner: z.string(),
+        repo: z.string(),
+        path: z.string().optional(),
+        ref: z.string().optional(),
+      },
+      async ({ owner, repo, path, ref }) => {
+        const filePath = path || "benchmarks/results.json";
+
+        if (
+          filePath.startsWith("/") ||
+          filePath.split("/").includes("..")
+        ) {
+          throw new Error("Invalid file path.");
+        }
+
+        const p = filePath.split("/").map(encodeURIComponent).join("/");
+        const q = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+
+        const file = await githubRequest(
+          this.env,
+          `/repos/${owner}/${repo}/contents/${p}${q}`
+        );
+
+        if (!file.content || file.encoding !== "base64") {
+          throw new Error("Benchmark file not found or not readable.");
+        }
+
+        const decoded = atob(file.content.replace(/\s/g, ""));
+        const content = new TextDecoder().decode(
+          Uint8Array.from(decoded, c => c.charCodeAt(0))
+        );
+
+        let results: unknown;
+
+        try {
+          results = JSON.parse(content);
+        } catch {
+          throw new Error("Benchmark file is not valid JSON.");
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              path: filePath,
+              results,
+            }, null, 2).slice(0, 18000),
+          }],
+        };
+      }
+    );
+
     // Create Codespace.
     this.server.tool(
       "github_create_codespace",
