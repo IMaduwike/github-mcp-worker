@@ -1,10 +1,16 @@
 import { McpAgent } from "agents/mcp";
+import OAuthProvider, {
+  type OAuthHelpers
+} from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 type Env = {
   GITHUB_TOKEN: string;
+  MCP_ACCESS_TOKEN: string;
   MCP_OBJECT: DurableObjectNamespace;
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
 };
 
 const API = "https://api.github.com";
@@ -451,41 +457,223 @@ export class GitHubMCP extends McpAgent<Env> {
   }
 }
 
-export default {
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/health") {
-      return Response.json({
-        ok: true,
-        service: "github-mcp-worker"
-      });
-    }
-
-    if (url.pathname === "/debug-env") {
-  return Response.json({
-    tokenExists: !!env.GITHUB_TOKEN,
-    tokenLength: env.GITHUB_TOKEN?.length ?? 0,
-    mcpBindingExists: !!env.MCP_OBJECT
-  });
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, char =>
+    `&#${char.charCodeAt(0)};`
+  );
 }
-    if (url.pathname !== "/mcp") {
-      return new Response("Not found", { status: 404 });
-    }
 
-    // Temporary MCP access token for testing.
-    // Change this to a long random value before production use.
-    if (
-      request.headers.get("Authorization") !==
-      "Bearer neon-mcp-test-2026-change-this"
-    ) {
-      return new Response("Unauthorized", { status: 401 });
-    }
+function accessPage(action: string, error = ""): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub MCP Authorization</title>
+</head>
+<body>
+<h1>GitHub MCP Authorization</h1>
+<p>Enter your private access code to continue.</p>
+${error ? `<p>${escapeHtml(error)}</p>` : ""}
+<form method="post" action="${escapeHtml(action)}">
+<input type="password" name="access_code"
+ autocomplete="current-password" required>
+<button type="submit">Continue</button>
+</form>
+</body>
+</html>`;
+}
 
-    return GitHubMCP.serve("/mcp").fetch(request, env, ctx);
+function consentPage(
+  details: Awaited<ReturnType<OAuthHelpers["describeConsent"]>>,
+  handle: string,
+  action: string
+): string {
+  const scopes = details.scope.map(scope =>
+    `<label><input type="checkbox" name="scope" value="${escapeHtml(scope)}" checked> ${escapeHtml(scope)}</label>`
+  ).join("<br>");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorize GitHub MCP</title>
+</head>
+<body>
+<h1>Authorize ${escapeHtml(details.clientName)}</h1>
+${details.clientDomain
+    ? `<p>Publisher: <strong>${escapeHtml(details.clientDomain)}</strong></p>`
+    : "<p>The publisher domain is not verified.</p>"}
+<p>Access will be sent to <strong>${escapeHtml(details.redirectHost)}</strong>.</p>
+${details.redirectIsLoopback
+    ? "<p>Warning: this redirects to a local application.</p>"
+    : ""}
+<form method="post" action="${escapeHtml(action)}">
+<input type="hidden" name="handle" value="${escapeHtml(handle)}">
+${scopes}
+<br><br>
+<button name="decision" value="approve">Allow</button>
+<button name="decision" value="deny">Deny</button>
+</form>
+</body>
+</html>`;
+}
+
+async function authorizationHandler(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const url = new URL(request.url);
+
+  if (url.pathname !== "/authorize") {
+    return new Response("Not found", { status: 404 });
   }
-};
+
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  };
+
+  // Preserve the original OAuth parameters through every form submission.
+  const action = url.pathname + url.search;
+
+  if (request.method === "GET") {
+    return new Response(accessPage(action), { headers });
+  }
+
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { Allow: "GET, POST" }
+    });
+  }
+
+  const form = await request.formData();
+
+  // OAuth consent submission.
+  if (form.has("handle")) {
+    const handle = String(form.get("handle") || "");
+
+    try {
+      if (String(form.get("decision")) !== "approve") {
+        const denied = await env.OAUTH_PROVIDER.denyConsent(
+          request,
+          handle
+        );
+
+        return new Response(null, {
+          status: 302,
+          headers: denied.headers
+        });
+      }
+
+      const approved = await env.OAUTH_PROVIDER.approveConsent(
+        request,
+        handle,
+        {
+          scope: form.getAll("scope").map(String)
+        }
+      );
+
+      const result =
+        await env.OAUTH_PROVIDER.completeAuthorization({
+          request: approved.request,
+          userId: "neon-owner",
+          metadata: {},
+          scope: approved.request.scope,
+          props: { userId: "neon-owner" }
+        });
+
+      approved.headers.set("Location", result.redirectTo);
+
+      return new Response(null, {
+        status: 302,
+        headers: approved.headers
+      });
+    } catch {
+      return new Response(
+        "Authorization expired or invalid. Restart authorization from your MCP client.",
+        { status: 400 }
+      );
+    }
+  }
+
+  // Check the private access code.
+  const expected = env.MCP_ACCESS_TOKEN?.trim();
+  const supplied = String(form.get("access_code") || "");
+
+  if (!expected || !supplied || !constantTimeEqual(supplied, expected)) {
+    return new Response(
+      accessPage(action, "Invalid access code."),
+      { status: 401, headers }
+    );
+  }
+
+  try {
+    const authRequest =
+      await env.OAUTH_PROVIDER.parseAuthRequest(request);
+
+    const details =
+      await env.OAUTH_PROVIDER.describeConsent(authRequest);
+
+    const consent =
+      await env.OAUTH_PROVIDER.beginConsent(authRequest);
+
+    consent.headers.set(
+      "Content-Type",
+      "text/html; charset=utf-8"
+    );
+    consent.headers.set("Cache-Control", "no-store");
+
+    return new Response(
+      consentPage(details, consent.handle, action),
+      { headers: consent.headers }
+    );
+  } catch {
+    return new Response(
+      "Invalid OAuth request. Restart authorization from your MCP client.",
+      { status: 400, headers }
+    );
+  }
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const aa = encoder.encode(a);
+  const bb = encoder.encode(b);
+
+  let difference = aa.length ^ bb.length;
+
+  for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
+    difference |= (aa[i] || 0) ^ (bb[i] || 0);
+  }
+
+  return difference === 0;
+}
+
+export default new OAuthProvider<Env>({
+  apiRoute: "/mcp",
+  apiHandler: GitHubMCP.serve("/mcp"),
+  defaultHandler: authorizationHandler,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/oauth/token",
+
+  scopesSupported: [
+    "mcp:read",
+    "mcp:write",
+    "offline_access"
+  ],
+
+  resourceMetadata: {
+    resource:
+      "https://github-mcp-worker.ifeanyimaduwike.workers.dev/mcp",
+    authorization_servers: [
+      "https://github-mcp-worker.ifeanyimaduwike.workers.dev"
+    ]
+  },
+
+  requiredScopes: ["mcp:read"],
+  clientIdMetadataDocumentEnabled: true
+});
