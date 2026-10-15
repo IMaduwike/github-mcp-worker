@@ -3,10 +3,18 @@
   "name": "github-mcp-worker",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-13",
-  "compatibility_flags": ["nodejs_compat"],
-  "secrets": {
-    "required": ["GITHUB_TOKEN"]
-  },
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public"
+  ],
+
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "9db9cc3ef28843e7b40258edaf1fe55a"
+    }
+  ],
+
   "durable_objects": {
     "bindings": [
       {
@@ -15,6 +23,7 @@
       }
     ]
   },
+
   "migrations": [
     {
       "tag": "v1",
